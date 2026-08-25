@@ -1,5 +1,53 @@
 # 更新日志
 
+## v4.4（2026-08-25）
+
+ss-2022.sh 1.9 → 2.0，menu.sh 4.3 → 4.4，block-mainland.sh 1.0 → 1.1
+
+### 严重：`set -e` 导致交互菜单在正常失败路径下直接退出
+- `ss-2022.sh` 是交互式菜单，多处用 `return 1` 表示"本次操作未成功"，但脚本开头的 `set -e` 会让这些裸调用直接杀掉整个进程。
+- 实际表现：菜单选「5. 停止」而服务本就没运行、选「4. 启动」而服务已在运行、选「8. 查看配置」而公网 IP 获取失败——都会打印一行错误后**退回 shell**。
+- 更隐蔽的是 `Install()`：`start_service` 失败时脚本立即退出，用于打印排错日志的 `else` 分支**从来没有被执行过**。
+- 已移除 `set -e`（含 `getipv4`/`getipv6` 里配套的 `set +e`/`set -e`），改为在依赖安装、服务安装等关键步骤显式判错并 `error_exit`。
+
+### 严重：ShadowTLS 安装全程不放行防火墙
+- `shadowtls.sh` 此前没有任何防火墙操作，而 ShadowTLS 的监听端口才是客户端实际连接的入口，在启用了 ufw / firewalld 的机器上装完直接连不上。
+- 新增 `open_firewall_port()` / `close_firewall_port()`，覆盖 ufw、firewalld、iptables（firewalld 激活时跳过 iptables 避免规则冲突），安装后自动放行、卸载时自动回收。
+
+### 严重：大陆屏蔽规则重启后静默失效
+- ipset 集合是内核内存态，重启必然清空；原实现只做了 `iptables-save > /etc/iptables/rules.v4`（且未 `mkdir -p`，非 Debian 机器上被 `|| true` 静默吞掉）。重启后屏蔽完全失效，而且若装有 netfilter-persistent，恢复的规则引用一个不存在的 set 会让整条 `iptables-restore` 失败。
+- 新增 `block-mainland.service`（`Type=oneshot` + `RemainAfterExit`），开机重跑规则脚本重建 ipset 并重新下规则；`disable` 时一并移除。
+- `show_status` 新增「开机自动恢复」一项，未启用时明确警告。
+
+### 严重：修改加密方式不校验密码，服务直接起不来
+- 「修改配置 → 3. 修改加密配置」原先只改 method 不动 password，从 `2022-blake3-aes-128-gcm`（16 字节）改到 `-256-gcm`（32 字节）后密钥长度不匹配，ss-rust 启动失败。
+- 新增 `ensure_password_matches_method()`，加密方式变更后自动校验密钥长度，不匹配时强制重新设置密码。
+- `Restart()` 原先无条件打印"重启完毕"，服务挂了用户毫无察觉；现在校验 `is-active` 并在失败时输出最近 20 行日志和常见原因提示。
+
+### 大陆屏蔽只覆盖主端口
+- 规则此前只针对 `detect_ss_port` 拿到的主端口，v3.3 引入的多端口节点（`/etc/ss-rust/ports/*.json`）和 ShadowTLS 监听端口都还对大陆开放，屏蔽等于被绕过。
+- 新增 `collect_protected_ports()`；生成的规则脚本改为在**运行时**自行探测端口，因此新增节点后开机自动恢复也能覆盖到。
+- 新增 `flush_mainland_rules()`：从 `iptables-save` 解析删除所有引用 `mainland_cn_src` 的规则，改过端口后的旧规则也能清干净（原实现按当前端口删，会永久残留）。
+- `show_status` 会列出实际生效的端口，并提示尚未纳入屏蔽的节点端口。
+
+### ShadowTLS 其他修复
+- `get_available_port()` 靠 stdout 返回端口，但失败时的错误信息也写 stdout，被 `$(...)` 一并吞掉，用户只看到"请重新输入端口"却不知道原因——错误信息改走 stderr；并补上 1-65535 范围校验。
+- `create_shadowtls_service()` 写完 service 文件后立即 `daemon-reload`。原先 `daemon-reload` 在所有 `systemctl start` 之后，覆盖已有 unit（如重装换端口）时 systemd 仍用旧配置启动。
+- `check_port_usage()` 改用 `ss`（`netstat` 在 Debian 12 / Ubuntu 22+ / AlmaLinux 9 默认不存在，命令找不到时一律返回"未占用"，检测形同虚设）；并改为精确匹配端口，修复 1000 被 10000 误判为占用的问题。
+- 新增 `verify_shadowtls_service()`：启动后校验服务是否真的在运行，失败时输出日志，不再装完就宣告成功。
+- systemd 单元里名为"性能优化"的参数实际在限制性能：移除 `CPUAffinity=0`（锁死单核）和 `CPUQuota=50%`（限制半核）；`MemoryLimit` 已废弃，改为 `MemoryMax`；`IOSchedulingClass` 由 `realtime` 降为 `best-effort`。
+- 卸载时一并清理日志文件。
+
+### 分享链接与其他
+- 分享链接的 userinfo 改用 websafe base64（SIP002 规定），原先用标准 `base64 -w 0`，2022 系列密码编码后会出现 `+` `/` `=`，严格解析的客户端会失败。新增 `b64_url()`，并删除定义了却从未被调用的 `Link_QR()` / `urlsafe_base64()`。
+- 修改 SS 端口后同步 ShadowTLS 后端端口：`shadowtls-ss.service` 里 `--server 127.0.0.1:<端口>` 是写死的，不同步会导致改完端口 ShadowTLS 直接失联（新增 `sync_shadowtls_backend_port()`）。
+- `Update()` 升级二进制后一并重启多端口节点服务（`ss-rust-<端口>`），此前它们会继续跑旧版本进程。
+- `set_port()` 新增端口占用校验，并在端口变更时回收旧端口的防火墙放行规则；`generate_random_port()` 自动跳过已被占用的端口。
+- 卸载 Shadowsocks Rust、删除多端口节点时回收防火墙规则（此前 `iptables -I INPUT ... ACCEPT` 只加不删，会持续堆积）。
+- `Update_Shell()` 修复以 `bash <(curl ...)` 方式运行时的更新路径：此时 `SCRIPT_PATH` 是 `/dev/fd`、`SCRIPT_NAME` 是文件描述符号，会把脚本写到错误位置；现在这种情况统一更新 `/usr/local/bin/ss-2022.sh`。
+- `menu.sh` 卸载 ShadowTLS 改为遍历 service 文件：`systemctl list-units` 只列出已加载的 unit，已停止的服务会被漏掉，导致卸载不干净。
+- `view_config` 中"端口被多个服务占用"的告警是误报（同一服务的 tcp/udp、IPv4/IPv6 本就会产生多行），改为单纯列出监听情况供排查。
+
 ## v4.3（2026-07-18）
 
 menu.sh 3.4 → 4.3：与 snell 项目的 menu.sh（v4.2）合并功能，两个仓库统一为同一份文件、同一版本号。

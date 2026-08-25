@@ -8,7 +8,7 @@ set -e
 # =========================================
 
 # 版本信息
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.1"
 
 # 脚本路径
 SCRIPT_PATH=$(cd "$(dirname "$0")"; pwd)
@@ -25,6 +25,8 @@ MMDB_FILE="${IPLIST_DIR}/Country.mmdb"
 IPTABLES_RULES="/etc/ss-rust/mainland_cn_rules.sh"
 EXTRACT_SCRIPT="$(cd "$(dirname "$0")"; pwd)/extract-cn-ip-from-mmdb.py"
 AUTO_UPDATE_CRON_FILE="/etc/cron.d/block-mainland-auto-update"
+BOOT_SERVICE_NAME="block-mainland.service"
+BOOT_SERVICE_FILE="/etc/systemd/system/block-mainland.service"
 AUTO_UPDATE_LOG_FILE="/var/log/block-mainland-update.log"
 DAILY_CRON_EXPR="30 4 * * *"
 WEEKLY_CRON_EXPR="30 4 * * 1"
@@ -267,6 +269,45 @@ PY
     fi
 }
 
+# 收集所有需要屏蔽的端口
+# 主节点端口之外，还必须覆盖 v3.3 引入的多端口节点，以及 ShadowTLS 的监听端口
+# （ShadowTLS 端口才是客户端实际连接的入口，漏掉等于屏蔽被完全绕过）
+collect_protected_ports() {
+    local ports=()
+    local p f svc
+
+    p=$(detect_ss_port)
+    [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
+
+    for f in /etc/ss-rust/ports/*.json; do
+        [ -f "$f" ] || continue
+        p=$(grep -oE '"server_port"[[:space:]]*:[[:space:]]*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+        [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
+    done
+
+    for svc in /etc/systemd/system/shadowtls-*.service; do
+        [ -f "$svc" ] || continue
+        p=$(grep -oE -- '--listen [^ ]+' "$svc" 2>/dev/null | head -1 | sed 's/.*://')
+        [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
+    done
+
+    [ ${#ports[@]} -eq 0 ] && return 0
+    printf '%s\n' "${ports[@]}" | sort -un
+}
+
+# 删除所有引用 mainland_cn_src 的 INPUT 规则
+# 直接从 iptables-save 里解析，而不是按当前端口列表删——否则改过端口后旧规则会永远残留
+flush_mainland_rules() {
+    local rule guard=0
+    while [ $guard -lt 100 ]; do
+        rule=$(iptables-save 2>/dev/null | grep -m1 -- "-A INPUT .*--match-set mainland_cn_src src" || true)
+        [ -z "$rule" ] && break
+        # shellcheck disable=SC2086
+        iptables -D INPUT ${rule#-A INPUT } 2>/dev/null || break
+        guard=$((guard + 1))
+    done
+}
+
 # 生成iptables规则
 generate_iptables_rules() {
     echo -e "${INFO} 生成iptables规则..."
@@ -276,41 +317,77 @@ generate_iptables_rules() {
         return 1
     fi
     
-    # 获取SS端口
-    local ss_port
-    ss_port=$(detect_ss_port)
-    echo -e "${INFO} 检测到SS端口: $ss_port"
-    
-    cat > "$IPTABLES_RULES" << EOF
+    local detected_ports
+    detected_ports=$(collect_protected_ports)
+    if [ -z "$detected_ports" ]; then
+        echo -e "${WARNING} 未检测到任何 SS / ShadowTLS 端口，将只使用默认端口"
+    else
+        echo -e "${INFO} 将屏蔽以下端口的大陆来源连接: $(echo "$detected_ports" | tr '\n' ' ')"
+    fi
+
+    # 规则脚本在**运行时**自行探测端口，这样新增多端口节点或 ShadowTLS 之后，
+    # 开机自动恢复也能覆盖到，无需重新生成
+    cat > "$IPTABLES_RULES" << 'RULESEOF'
 #!/bin/bash
 # 中国大陆IP屏蔽规则
 # 自动生成，请勿手动修改
 
-set -e
+set -u
 
-# 清除旧规则
+# 运行时探测所有需要保护的端口：主节点 + 多端口节点 + ShadowTLS 入口
+collect_ports() {
+    local ports=() p f svc
+
+    if [ -f /etc/ss-rust/config.json ]; then
+        p=$(grep -oE '"server_port"[[:space:]]*:[[:space:]]*[0-9]+' /etc/ss-rust/config.json 2>/dev/null | grep -oE '[0-9]+' | head -1)
+        [ -n "${p:-}" ] && ports+=("$p")
+    fi
+
+    for f in /etc/ss-rust/ports/*.json; do
+        [ -f "$f" ] || continue
+        p=$(grep -oE '"server_port"[[:space:]]*:[[:space:]]*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+        [ -n "${p:-}" ] && ports+=("$p")
+    done
+
+    for svc in /etc/systemd/system/shadowtls-*.service; do
+        [ -f "$svc" ] || continue
+        p=$(grep -oE -- '--listen [^ ]+' "$svc" 2>/dev/null | head -1 | sed 's/.*://')
+        case "${p:-}" in
+            ''|*[!0-9]*) ;;
+            *) ports+=("$p") ;;
+        esac
+    done
+
+    [ ${#ports[@]} -eq 0 ] && ports=("8388")
+    printf '%s\n' "${ports[@]}" | sort -un
+}
+
 echo "[信息] 清除旧的屏蔽规则..."
-iptables -D INPUT -p tcp --dport $ss_port -m set --match-set mainland_cn_src src -j DROP 2>/dev/null || true
-iptables -D INPUT -p udp --dport $ss_port -m set --match-set mainland_cn_src src -j DROP 2>/dev/null || true
-iptables -D INPUT -p tcp -m set --match-set mainland_cn_src src -j DROP 2>/dev/null || true
-iptables -D INPUT -p udp -m set --match-set mainland_cn_src src -j DROP 2>/dev/null || true
+# 按 iptables-save 解析删除，确保改过端口后的旧规则也能清干净
+guard=0
+while [ $guard -lt 100 ]; do
+    rule=$(iptables-save 2>/dev/null | grep -m1 -- "-A INPUT .*--match-set mainland_cn_src src" || true)
+    [ -z "$rule" ] && break
+    iptables -D INPUT ${rule#-A INPUT } 2>/dev/null || break
+    guard=$((guard + 1))
+done
 ipset destroy mainland_cn_src 2>/dev/null || true
 
 echo "[信息] 创建ipset集合..."
-# 创建ipset集合用于存储IP列表
 ipset create mainland_cn_src hash:net maxelem 200000
 
 echo "[信息] 导入IP列表..."
-# 从文件导入IP
 /usr/local/bin/block-mainland-import-ips.sh
 
 echo "[信息] 应用iptables规则..."
-# 添加规则：仅屏蔽来自中国大陆且目标为SS端口的连接
-iptables -I INPUT -p tcp --dport $ss_port -m set --match-set mainland_cn_src src -j DROP
-iptables -I INPUT -p udp --dport $ss_port -m set --match-set mainland_cn_src src -j DROP
+for port in $(collect_ports); do
+    echo "[信息]   屏蔽端口 ${port}"
+    iptables -I INPUT -p tcp --dport "$port" -m set --match-set mainland_cn_src src -j DROP
+    iptables -I INPUT -p udp --dport "$port" -m set --match-set mainland_cn_src src -j DROP
+done
 
 echo "[成功] 规则应用完成"
-EOF
+RULESEOF
     
     chmod +x "$IPTABLES_RULES"
     echo -e "${SUCCESS} iptables规则生成完成"
@@ -389,6 +466,47 @@ install_ipset() {
     echo -e "${SUCCESS} ipset检查完成"
 }
 
+# 安装开机自动恢复服务
+# ipset 集合是内核内存态，重启后必然消失；只保存 iptables 规则不但无效，
+# 还会因为规则引用了不存在的 set 导致 iptables-restore 整体失败。
+# 因此改为开机重跑一次规则脚本（会重建 ipset 并重新下规则）。
+install_boot_service() {
+    echo -e "${INFO} 配置开机自动恢复..."
+
+    cat > "$BOOT_SERVICE_FILE" << EOF
+[Unit]
+Description=Block mainland China IPs for Shadowsocks
+After=network-online.target ss-rust.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash ${IPTABLES_RULES}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    if systemctl enable "$BOOT_SERVICE_NAME" >/dev/null 2>&1; then
+        echo -e "${SUCCESS} 已启用开机自动恢复（${BOOT_SERVICE_NAME}）"
+    else
+        echo -e "${WARNING} 开机自动恢复服务启用失败，重启后需手动执行: bash $IPTABLES_RULES"
+    fi
+}
+
+# 移除开机自动恢复服务
+remove_boot_service() {
+    if [ -f "$BOOT_SERVICE_FILE" ]; then
+        systemctl disable "$BOOT_SERVICE_NAME" >/dev/null 2>&1 || true
+        rm -f "$BOOT_SERVICE_FILE"
+        systemctl daemon-reload
+    fi
+}
+
 # 启用屏蔽规则
 enable_blocking() {
     echo -e "${INFO} 启用屏蔽规则..."
@@ -397,14 +515,23 @@ enable_blocking() {
     install_ipset
     
     # 生成并执行规则
-    if [ -f "$IPTABLES_RULES" ]; then
-        bash "$IPTABLES_RULES"
+    if [ ! -f "$IPTABLES_RULES" ]; then
+        echo -e "${ERROR} 规则文件不存在: $IPTABLES_RULES"
+        return 1
+    fi
+    if ! bash "$IPTABLES_RULES"; then
+        echo -e "${ERROR} 规则应用失败"
+        return 1
     fi
     
-    # 保存iptables规则（使用iptables-save/iptables-restore）
+    # 保存iptables规则（部分系统装了 netfilter-persistent 会用到；目录可能不存在）
     if command -v iptables-save &> /dev/null; then
+        mkdir -p /etc/iptables 2>/dev/null || true
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     fi
+
+    # 关键：重启后 ipset 会清空，必须靠开机服务重建
+    install_boot_service
     
     echo -e "${SUCCESS} 屏蔽规则已启用"
 }
@@ -413,32 +540,32 @@ enable_blocking() {
 disable_blocking() {
     echo -e "${INFO} 禁用屏蔽规则..."
 
-    local ss_port
-    ss_port=$(detect_ss_port)
-    
-    # 删除当前端口规则
-    iptables -D INPUT -p tcp --dport "$ss_port" -m set --match-set mainland_cn_src src -j DROP 2>/dev/null || true
-    iptables -D INPUT -p udp --dport "$ss_port" -m set --match-set mainland_cn_src src -j DROP 2>/dev/null || true
-
-    # 兼容清理旧版（未带端口）规则
-    iptables -D INPUT -p tcp -m set --match-set mainland_cn_src src -j DROP 2>/dev/null || true
-    iptables -D INPUT -p udp -m set --match-set mainland_cn_src src -j DROP 2>/dev/null || true
+    # 删除所有引用 mainland_cn_src 的规则（不依赖当前端口，改过端口的旧规则也能清掉）
+    flush_mainland_rules
     
     # 删除ipset
     ipset destroy mainland_cn_src 2>/dev/null || true
+
+    # 取消开机自动恢复，否则重启后又会被重新下上
+    remove_boot_service
+
+    # 同步已保存的规则，避免 netfilter-persistent 在重启时恢复旧规则
+    if command -v iptables-save &> /dev/null && [ -f /etc/iptables/rules.v4 ]; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
     
     echo -e "${SUCCESS} 屏蔽规则已禁用"
 }
 
 # 查看规则状态
 show_status() {
-    local ss_port
-    ss_port=$(detect_ss_port)
+    local protected_ports
+    protected_ports=$(collect_protected_ports | tr '\n' ' ')
 
     echo -e "${BLUE}${BOLD}═══════════════════════════════════${PLAIN}"
     echo -e "${BLUE}${BOLD}    中国大陆屏蔽规则状态${PLAIN}"
     echo -e "${BLUE}${BOLD}═══════════════════════════════════${PLAIN}"
-    echo -e "${BOLD}当前SS端口:${PLAIN} $ss_port"
+    echo -e "${BOLD}受保护端口:${PLAIN} ${protected_ports:-无}"
     
     echo ""
     echo -e "${BOLD}IP列表文件:${PLAIN}"
@@ -462,10 +589,34 @@ show_status() {
     
     echo ""
     echo -e "${BOLD}iptables规则:${PLAIN}"
-    if iptables -S INPUT 2>/dev/null | grep -q "mainland_cn_src" || iptables -L INPUT -n 2>/dev/null | grep -q "mainland_cn_src"; then
+    local rule_ports
+    rule_ports=$(iptables -S INPUT 2>/dev/null | grep -- "--match-set mainland_cn_src src" | grep -oE '\-\-dport [0-9]+' | awk '{print $2}' | sort -un | tr '\n' ' ')
+    if [ -n "$rule_ports" ]; then
+        echo -e "  ${GREEN}✓${PLAIN} 已启用 (生效端口: ${rule_ports})"
+        # 有节点端口没被覆盖时明确提示，否则用户会以为已经全屏蔽了
+        local missing="" pt
+        for pt in $(collect_protected_ports); do
+            case " $rule_ports " in
+                *" $pt "*) ;;
+                *) missing="${missing}${pt} " ;;
+            esac
+        done
+        if [ -n "$missing" ]; then
+            echo -e "  ${YELLOW}!${PLAIN} 以下端口尚未纳入屏蔽: ${missing}"
+            echo -e "  ${YELLOW}!${PLAIN} 请重新执行\"初始化并启用屏蔽\"以覆盖新增节点"
+        fi
+    elif iptables -S INPUT 2>/dev/null | grep -q "mainland_cn_src"; then
         echo -e "  ${GREEN}✓${PLAIN} 已启用"
     else
         echo -e "  ${RED}✗${PLAIN} 未启用"
+    fi
+
+    echo ""
+    echo -e "${BOLD}开机自动恢复:${PLAIN}"
+    if [ -f "$BOOT_SERVICE_FILE" ] && systemctl is-enabled "$BOOT_SERVICE_NAME" >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${PLAIN} 已启用 (${BOOT_SERVICE_NAME})"
+    else
+        echo -e "  ${RED}✗${PLAIN} 未启用 — 服务器重启后屏蔽规则将失效"
     fi
     
     echo ""

@@ -249,12 +249,100 @@ generate_random_port() {
 }
 
 # 检查端口是否被占用
+# 说明：Debian 12 / Ubuntu 22+ / AlmaLinux 9 默认不装 net-tools（无 netstat），
+# 优先用 iproute2 的 ss；并且必须精确匹配端口，否则 1000 会被 10000 误判为占用
 check_port_usage() {
     local port=$1
-    if netstat -tuln | grep -q ":${port}"; then
-        return 0  # 端口被占用
+    # ss 的地址在第 5 列、netstat 在第 4 列，列号不通用，
+    # 统一用"端口前必须是 : 或 . 、端口后不能再跟数字"的正则精确匹配
+    if command -v ss >/dev/null 2>&1; then
+        ss -tuln 2>/dev/null | grep -Eq "[:.]${port}([^0-9]|$)" && return 0
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tuln 2>/dev/null | grep -Eq "[:.]${port}([^0-9]|$)" && return 0
     fi
-    return 1     # 端口未被占用
+    return 1     # 端口未被占用（或两个工具都不存在，无法判断）
+}
+
+# 列出某端口的监听情况（排查用，ss/netstat 都没有时静默跳过）
+show_port_listeners() {
+    local port=$1
+    local out=""
+    if command -v ss >/dev/null 2>&1; then
+        out=$(ss -tulnp 2>/dev/null | awk -v p="$port" 'NR==1 || $5 ~ "[:.]"p"$"')
+    elif command -v netstat >/dev/null 2>&1; then
+        out=$(netstat -tulnp 2>/dev/null | awk -v p="$port" '$4 ~ "[:.]"p"$"')
+    else
+        return 0
+    fi
+    if [ -n "$out" ]; then
+        echo -e "${YELLOW}端口 ${port} 监听情况：${RESET}"
+        echo "$out"
+    fi
+}
+
+# 防火墙放行 ShadowTLS 监听端口
+# ShadowTLS 的监听端口才是客户端实际连接的入口，开了 ufw/firewalld 时不放行会直接连不上
+open_firewall_port() {
+    local port=$1
+    [ -z "$port" ] && return 0
+    echo -e "${CYAN}正在放行防火墙端口 ${port} ...${RESET}"
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qw active; then
+        ufw allow ${port}/tcp >/dev/null 2>&1 || true
+        ufw allow ${port}/udp >/dev/null 2>&1 || true
+        echo -e "${GREEN}UFW 已放行端口 ${port}${RESET}"
+    fi
+
+    local firewalld_active=0
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewalld_active=1
+        firewall-cmd --permanent --add-port=${port}/tcp >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port=${port}/udp >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        echo -e "${GREEN}firewalld 已放行端口 ${port}${RESET}"
+    fi
+
+    if [ $firewalld_active -eq 0 ] && command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1 || \
+            iptables -I INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1 || true
+        iptables -C INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1 || \
+            iptables -I INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1 || true
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables.rules 2>/dev/null || true
+        fi
+        echo -e "${GREEN}iptables 已放行端口 ${port}${RESET}"
+    fi
+}
+
+# 卸载时回收防火墙放行规则
+close_firewall_port() {
+    local port=$1
+    [ -z "$port" ] && return 0
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qw active; then
+        ufw delete allow ${port}/tcp >/dev/null 2>&1 || true
+        ufw delete allow ${port}/udp >/dev/null 2>&1 || true
+    fi
+
+    local firewalld_active=0
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewalld_active=1
+        firewall-cmd --permanent --remove-port=${port}/tcp >/dev/null 2>&1 || true
+        firewall-cmd --permanent --remove-port=${port}/udp >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+
+    if [ $firewalld_active -eq 0 ] && command -v iptables >/dev/null 2>&1; then
+        while iptables -C INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1; do
+            iptables -D INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1 || break
+        done
+        while iptables -C INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1; do
+            iptables -D INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1 || break
+        done
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables.rules 2>/dev/null || true
+        fi
+    fi
 }
 
 # 获取已使用的 ShadowTLS 端口
@@ -291,17 +379,22 @@ get_available_port() {
     
     # 如果用户指定了端口
     if [ ! -z "$port" ]; then
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            echo -e "${RED}端口必须是 1-65535 之间的数字${RESET}" >&2
+            return 1
+        fi
+
         # 检查端口是否已被 ShadowTLS 使用
         for used_port in "${used_ports[@]}"; do
             if [ "$port" = "$used_port" ]; then
-                echo -e "${RED}端口 ${port} 已被其他 ShadowTLS 服务使用${RESET}"
+                echo -e "${RED}端口 ${port} 已被其他 ShadowTLS 服务使用${RESET}" >&2
                 return 1
             fi
         done
         
         # 检查端口是否被其他服务使用
         if check_port_usage "$port"; then
-            echo -e "${RED}端口 ${port} 已被其他服务占用${RESET}"
+            echo -e "${RED}端口 ${port} 已被其他服务占用${RESET}" >&2
             return 1
         fi
         
@@ -332,7 +425,7 @@ get_available_port() {
         attempts=$((attempts + 1))
     done
     
-    echo -e "${RED}无法找到可用端口${RESET}"
+    echo -e "${RED}无法找到可用端口${RESET}" >&2
     return 1
 }
 
@@ -480,14 +573,13 @@ SyslogIdentifier=${identifier}
 Restart=always
 RestartSec=3
 
-# 性能优化参数
+# 资源限制
+# 注意：不要设置 CPUAffinity / CPUQuota，那会把服务锁死在单核或半核上，高并发下成为瓶颈
 LimitNOFILE=65535
-CPUAffinity=0
 Nice=0
-IOSchedulingClass=realtime
+IOSchedulingClass=best-effort
 IOSchedulingPriority=0
-MemoryLimit=512M
-CPUQuota=50%
+MemoryMax=512M
 LimitCORE=infinity
 LimitRSS=infinity
 LimitNPROC=65535
@@ -515,6 +607,23 @@ EOF
     touch "/var/log/shadowtls-${identifier}.log"
     chmod 640 "/var/log/shadowtls-${identifier}.log"
     chown root:root "/var/log/shadowtls-${identifier}.log"
+
+    # 必须在 start 之前重载：覆盖已有 unit 文件时 systemd 不会自动感知，会继续用旧配置启动
+    systemctl daemon-reload
+}
+
+# 校验 ShadowTLS 服务是否真的启动成功（原先装完直接宣告成功，起不来也不提示）
+verify_shadowtls_service() {
+    local service_name=$1
+    sleep 1
+    if systemctl is-active "$service_name" >/dev/null 2>&1; then
+        echo -e "${GREEN}${service_name} 已启动${RESET}"
+        return 0
+    fi
+    echo -e "${RED}${service_name} 启动失败！最近日志：${RESET}"
+    journalctl --no-pager -n 20 -u "$service_name" 2>/dev/null || true
+    echo -e "${YELLOW}请检查后端服务是否在运行、监听端口是否被占用${RESET}"
+    return 1
 }
 
 # 安装 ShadowTLS
@@ -649,8 +758,10 @@ install_shadowtls() {
         # 创建 SS 的 ShadowTLS 服务
         local ss_port=$(get_ssrust_port)
         create_shadowtls_service "ss" "$ss_port" "$ss_listen_port" "$tls_domain" "$password"
-        systemctl start shadowtls-ss
-        systemctl enable shadowtls-ss
+        systemctl enable shadowtls-ss >/dev/null 2>&1
+        systemctl restart shadowtls-ss
+        open_firewall_port "$ss_listen_port"
+        verify_shadowtls_service "shadowtls-ss"
     fi
     
     # 配置 Snell
@@ -704,8 +815,10 @@ install_shadowtls() {
                 
                 # 创建服务文件
                 create_shadowtls_service "snell" "$port" "$stls_port" "$tls_domain" "$password"
-                systemctl start "shadowtls-snell-${port}"
-                systemctl enable "shadowtls-snell-${port}"
+                systemctl enable "shadowtls-snell-${port}" >/dev/null 2>&1
+                systemctl restart "shadowtls-snell-${port}"
+                open_firewall_port "$stls_port"
+                verify_shadowtls_service "shadowtls-snell-${port}"
             done
         elif [[ "$port_choice" =~ ^[0-9]+$ ]] && [ "$port_choice" -ge 1 ] && [ "$port_choice" -le ${#port_list[@]} ]; then
             # 为选中的端口配置 ShadowTLS
@@ -726,8 +839,10 @@ install_shadowtls() {
             
             # 创建服务文件
             create_shadowtls_service "snell" "$selected_port" "$stls_port" "$tls_domain" "$password"
-            systemctl start "shadowtls-snell-${selected_port}"
-            systemctl enable "shadowtls-snell-${selected_port}"
+            systemctl enable "shadowtls-snell-${selected_port}" >/dev/null 2>&1
+            systemctl restart "shadowtls-snell-${selected_port}"
+            open_firewall_port "$stls_port"
+            verify_shadowtls_service "shadowtls-snell-${selected_port}"
         else
             echo -e "${RED}无效的选择${RESET}"
             return 1
@@ -771,9 +886,12 @@ uninstall_shadowtls() {
     
     # 停止并禁用 SS 服务
     if [ -f "${SYSTEMD_DIR}/shadowtls-ss.service" ]; then
+        local ss_stls_port=$(get_stls_listen_port "${SYSTEMD_DIR}/shadowtls-ss.service")
         systemctl stop shadowtls-ss 2>/dev/null
         systemctl disable shadowtls-ss 2>/dev/null
         rm -f "${SYSTEMD_DIR}/shadowtls-ss.service"
+        rm -f "/var/log/shadowtls-shadow-tls-ss.log"
+        [ -n "$ss_stls_port" ] && close_firewall_port "$ss_stls_port"
     fi
     
     # 停止并禁用所有 Snell 相关的 ShadowTLS 服务
@@ -781,9 +899,13 @@ uninstall_shadowtls() {
     if [ ! -z "$snell_services" ]; then
         while IFS= read -r service_file; do
             local service_name=$(basename "$service_file")
+            local snell_stls_port=$(get_stls_listen_port "$service_file")
+            local snell_port=$(echo "$service_name" | sed 's/shadowtls-snell-\([0-9]*\)\.service/\1/')
             systemctl stop "$service_name" 2>/dev/null
             systemctl disable "$service_name" 2>/dev/null
             rm -f "$service_file"
+            rm -f "/var/log/shadowtls-shadow-tls-snell-${snell_port}.log"
+            [ -n "$snell_stls_port" ] && close_firewall_port "$snell_stls_port"
         done <<< "$snell_services"
     fi
     
@@ -881,14 +1003,8 @@ view_config() {
                             local service_status=$(systemctl is-active "shadowtls-snell-${port}")
                             if [ "$service_status" = "active" ]; then
                                 echo -e "\n${GREEN}服务状态：正在运行${RESET}"
-                                # 检查端口占用情况
-                                local port_usage=$(netstat -tuln | grep ":${stls_port}")
-                                local port_count=$(echo "$port_usage" | wc -l)
-                                if [ "$port_count" -gt 1 ]; then
-                                    echo -e "${RED}警告：端口 ${stls_port} 被多个服务占用！${RESET}"
-                                    echo -e "${YELLOW}端口占用情况：${RESET}"
-                                    netstat -tuln | grep ":${stls_port}"
-                                fi
+                                # 列出该端口的实际监听情况（仅供排查）
+                                show_port_listeners "$stls_port"
                             else
                                 echo -e "\n${RED}服务状态：未运行${RESET}"
                                 echo -e "${YELLOW}请尝试以下命令重启服务：${RESET}"
@@ -1015,8 +1131,10 @@ add_shadowtls_config() {
                 # 创建 SS 的 ShadowTLS 服务
                 local ss_port=$(get_ssrust_port)
                 create_shadowtls_service "ss" "$ss_port" "$ss_listen_port" "$tls_domain" "$password"
-                systemctl start shadowtls-ss
-                systemctl enable shadowtls-ss
+                systemctl enable shadowtls-ss >/dev/null 2>&1
+                systemctl restart shadowtls-ss
+                open_firewall_port "$ss_listen_port"
+                verify_shadowtls_service "shadowtls-ss"
                 
                 # 显示配置信息
                 local server_ip=$(get_server_ip)
@@ -1114,8 +1232,10 @@ add_shadowtls_config() {
                     
                     # 创建服务文件
                     create_shadowtls_service "snell" "$selected_port" "$stls_port" "$tls_domain" "$password"
-                    systemctl start "shadowtls-snell-${selected_port}"
-                    systemctl enable "shadowtls-snell-${selected_port}"
+                    systemctl enable "shadowtls-snell-${selected_port}" >/dev/null 2>&1
+                    systemctl restart "shadowtls-snell-${selected_port}"
+                    open_firewall_port "$stls_port"
+                    verify_shadowtls_service "shadowtls-snell-${selected_port}"
                     
                     # 显示配置信息
                     local server_ip=$(get_server_ip)

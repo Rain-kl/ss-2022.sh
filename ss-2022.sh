@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -e
+# 注意：本脚本为交互式菜单，多处用 return 1 表示"本次操作未成功"，
+# 因此不能开启 set -e（会导致停止/启动/查看等正常失败路径直接退出整个脚本）。
+# 关键步骤一律显式判错并调用 error_exit。
 
 # =========================================
 # 作者: jinqians
@@ -9,11 +11,11 @@ set -e
 # =========================================
 
 # 版本信息
-SCRIPT_VERSION="1.9"
+SCRIPT_VERSION="2.0"
 SS_VERSION=""
 
 # 系统路径
-SCRIPT_PATH=$(cd "$(dirname "$0")"; pwd)
+SCRIPT_PATH=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 SCRIPT_DIR=$(dirname "${SCRIPT_PATH}")
 SCRIPT_NAME=$(basename "$0")
 
@@ -404,10 +406,10 @@ WantedBy=multi-user.target
 EOF
 
     echo -e "${INFO} 重新加载 systemd 配置..."
-    systemctl daemon-reload
+    systemctl daemon-reload || error_exit "systemctl daemon-reload 失败！"
     
     echo -e "${INFO} 启用 ss-rust 服务..."
-    systemctl enable ss-rust
+    systemctl enable ss-rust || error_exit "启用 ss-rust 服务失败！"
     
     echo -e "${SUCCESS} Shadowsocks Rust 服务配置完成！"
 }
@@ -467,8 +469,9 @@ install_dependencies() {
         ${pkg_mgr} install -y jq gzip wget curl unzip xz openssl tar || error_exit "系统依赖安装失败，请检查网络和软件源"
         ${pkg_mgr} install -y qrencode || echo -e "${WARNING} qrencode 安装失败，二维码功能不可用，不影响其他功能"
     else
-        apt-get update
-        apt-get install -y jq gzip wget curl unzip xz-utils openssl qrencode tar
+        apt-get update || echo -e "${WARNING} apt-get update 失败，将尝试直接安装"
+        apt-get install -y jq gzip wget curl unzip xz-utils openssl tar || error_exit "系统依赖安装失败，请检查网络和软件源"
+        apt-get install -y qrencode || echo -e "${WARNING} qrencode 安装失败，二维码功能不可用，不影响其他功能"
     fi
     
     # 设置时区
@@ -569,11 +572,79 @@ check_firewall() {
     fi
 }
 
-# 生成随机端口
+# 关闭防火墙上对某端口的放行（改端口/删节点时回收，避免规则越积越多）
+close_firewall_port() {
+    local port=$1
+    [[ -z "${port}" ]] && return 0
+    echo -e "${INFO} 回收端口 ${port} 的防火墙放行规则..."
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qw active; then
+        ufw delete allow ${port}/tcp >/dev/null 2>&1 || true
+        ufw delete allow ${port}/udp >/dev/null 2>&1 || true
+    fi
+
+    local firewalld_active=0
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewalld_active=1
+        firewall-cmd --permanent --remove-port=${port}/tcp >/dev/null 2>&1 || true
+        firewall-cmd --permanent --remove-port=${port}/udp >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+
+    if [[ ${firewalld_active} -eq 0 ]] && command -v iptables >/dev/null 2>&1; then
+        # 同一条规则可能被重复插入过，循环删干净
+        while iptables -C INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1; do
+            iptables -D INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1 || break
+        done
+        while iptables -C INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1; do
+            iptables -D INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1 || break
+        done
+        if [[ ${OS_TYPE} == "centos" ]]; then
+            service iptables save >/dev/null 2>&1 || true
+        else
+            iptables-save > /etc/iptables.rules 2>/dev/null || true
+        fi
+    fi
+}
+
+# SS 端口变更后同步 ShadowTLS 的后端端口
+# shadowtls-ss.service 里 --server 127.0.0.1:<端口> 是写死的，不同步会导致 ShadowTLS 直接失联
+sync_shadowtls_backend_port() {
+    local new_port=$1
+    local svc="/etc/systemd/system/shadowtls-ss.service"
+    [[ -f "${svc}" ]] || return 0
+    [[ -z "${new_port}" ]] && return 0
+
+    local cur_backend
+    cur_backend=$(grep -oP '(?<=--server )\S+' "${svc}" 2>/dev/null | head -1)
+    [[ -z "${cur_backend}" ]] && return 0
+    [[ "${cur_backend##*:}" == "${new_port}" ]] && return 0
+
+    echo -e "${INFO} 检测到 ShadowTLS，正在同步其后端端口 ${cur_backend##*:} -> ${new_port} ..."
+    sed -i "s|--server ${cur_backend}|--server 127.0.0.1:${new_port}|" "${svc}"
+    systemctl daemon-reload
+    if systemctl restart shadowtls-ss 2>/dev/null && systemctl is-active shadowtls-ss >/dev/null 2>&1; then
+        echo -e "${SUCCESS} ShadowTLS 后端端口已同步"
+    else
+        echo -e "${WARNING} ShadowTLS 重启失败，请手动检查：systemctl status shadowtls-ss"
+    fi
+}
+
+# 生成随机端口（自动跳过已被占用的端口）
 generate_random_port() {
     local min_port=10000
     local max_port=65535
-    echo $(shuf -i ${min_port}-${max_port} -n 1)
+    local port attempts=0
+    while (( attempts < 20 )); do
+        port=$(shuf -i ${min_port}-${max_port} -n 1)
+        if ! port_in_use "${port}"; then
+            echo "${port}"
+            return 0
+        fi
+        attempts=$((attempts + 1))
+    done
+    # 兜底：连续 20 次都撞上占用端口时直接返回最后一个
+    echo "${port}"
 }
 
 # 按加密方式生成符合密钥长度要求的随机密码
@@ -650,6 +721,7 @@ build_plugin_param() {
 
 # 设置端口
 set_port() {
+    local old_port="${SS_PORT}"
     SS_PORT=$(generate_random_port)
     echo -e "${INFO} 已生成随机端口：${SS_PORT}"
     echo -e "${Tip} 是否使用该随机端口？"
@@ -667,15 +739,20 @@ set_port() {
             read -e -p "(默认：2525)：" SS_PORT
             [[ -z "${SS_PORT}" ]] && SS_PORT="2525"
             
-            if [[ ${SS_PORT} =~ ^[0-9]+$ ]]; then
-                if (( SS_PORT >= 1 && SS_PORT <= 65535 )); then
-                    break
-                else
-                    echo -e "${Error} 输入错误，端口范围必须在 1-65535 之间"
-                fi
-            else
+            if ! [[ ${SS_PORT} =~ ^[0-9]+$ ]]; then
                 echo -e "${Error} 输入错误，请输入数字"
+                continue
             fi
+            if (( SS_PORT < 1 || SS_PORT > 65535 )); then
+                echo -e "${Error} 输入错误，端口范围必须在 1-65535 之间"
+                continue
+            fi
+            # 端口已被其他服务占用时 ss-rust 会启动失败，提前拦下
+            if [[ "${SS_PORT}" != "${old_port}" ]] && port_in_use "${SS_PORT}"; then
+                echo -e "${Error} 端口 ${SS_PORT} 已被其他服务占用，请换一个"
+                continue
+            fi
+            break
         done
     fi
     
@@ -685,6 +762,11 @@ set_port() {
     
     # 检查并配置防火墙
     check_firewall "${SS_PORT}"
+
+    # 端口变更时回收旧端口的放行规则，避免 iptables 里堆积无用 ACCEPT
+    if [[ -n "${old_port}" && "${old_port}" != "${SS_PORT}" ]]; then
+        close_firewall_port "${old_port}"
+    fi
     echo
 }
 
@@ -892,6 +974,21 @@ set_plugin() {
     echo "==================================" && echo
 }
 
+# 加密方式变更后校验密码是否仍满足密钥长度要求
+# 2022-blake3 系列对密钥字节数有硬性要求，不匹配会导致 ss-rust 启动失败
+ensure_password_matches_method() {
+    local required_len decoded_len
+    required_len=$(required_key_length "${SS_METHOD}")
+    [[ -z "${required_len}" ]] && return 0
+
+    decoded_len=$(echo -n "${SS_PASSWORD}" | base64 -d 2>/dev/null | wc -c)
+    [[ ${decoded_len} -eq ${required_len} ]] && return 0
+
+    echo -e "${WARNING} 当前密码解码后为 ${decoded_len} 字节，而 ${SS_METHOD} 要求 ${required_len} 字节"
+    echo -e "${WARNING} 加密方式已变更，必须重新设置密码"
+    set_password
+}
+
 # 修改配置
 modify_config() {
     check_installation
@@ -914,6 +1011,7 @@ modify_config() {
             set_port
             write_config
             Restart
+            sync_shadowtls_backend_port "${SS_PORT}"
             ;;
         2)
             read_config
@@ -924,6 +1022,7 @@ modify_config() {
         3)
             read_config
             set_method
+            ensure_password_matches_method
             write_config
             Restart
             ;;
@@ -955,6 +1054,7 @@ modify_config() {
             set_plugin
             write_config
             Restart
+            sync_shadowtls_backend_port "${SS_PORT}"
             ;;
         *)
             echo -e "${Error} 请输入正确的数字(1-7)"
@@ -1002,9 +1102,7 @@ Install() {
     ln -s "/usr/local/bin/ss-2022.sh" "/usr/local/bin/ssrust"
     
     echo -e "${Info} 所有步骤安装完毕，开始启动服务..."
-    start_service
-    
-    if [[ "$?" == "0" ]]; then
+    if start_service; then
         echo -e "${Success} Shadowsocks Rust 安装并启动成功！"
         View
         echo -e "${Info} 您可以使用 ${Green_font_prefix}ssrust${Font_color_suffix} 命令进行管理"
@@ -1062,7 +1160,15 @@ Stop() {
 Restart() {
     check_installed_status || return 1
     systemctl restart ss-rust
-    echo -e "${Info} Shadowsocks Rust 重启完毕！"
+    sleep 1
+    if systemctl is-active ss-rust >/dev/null 2>&1; then
+        echo -e "${Info} Shadowsocks Rust 重启完毕！"
+        return 0
+    fi
+    echo -e "${Error} Shadowsocks Rust 重启后未能正常运行！最近日志："
+    journalctl --no-pager -n 20 -u ss-rust 2>/dev/null || true
+    echo -e "${Tip} 常见原因：密码长度与加密方式不匹配、端口被占用、插件未安装"
+    return 1
 }
 
 # 更新
@@ -1087,6 +1193,14 @@ Update() {
             detect_arch
             download_ss "${new_ver#v}" "${OS_ARCH}"
             systemctl restart ss-rust
+            # 多端口节点是独立的 systemd 服务，不重启会继续跑旧版本进程
+            local extra_service svc_name
+            for extra_service in /etc/systemd/system/ss-rust-*.service; do
+                [[ -f "${extra_service}" ]] || continue
+                svc_name=$(basename "${extra_service}" .service)
+                echo -e "${Info} 重启多端口节点服务 ${svc_name} ..."
+                systemctl restart "${svc_name}" 2>/dev/null || echo -e "${WARNING} ${svc_name} 重启失败"
+            done
             echo -e "${Success} Shadowsocks Rust 已更新到最新版本 [ ${new_ver} ]"
         else
             echo -e "${Info} 已取消更新"
@@ -1107,18 +1221,25 @@ Uninstall() {
     read -e -p "(默认：n)：" unyn
     [[ -z ${unyn} ]] && unyn="n"
     if [[ ${unyn} == [Yy] ]]; then
+        # 先取端口，配置目录删掉后就拿不到了
+        local main_port=""
+        [[ -f "${CONFIG_PATH}" ]] && main_port=$(jq -r '.server_port // empty' "${CONFIG_PATH}" 2>/dev/null)
+
         check_status
         [[ "$status" == "running" ]] && systemctl stop ss-rust
         systemctl disable ss-rust
+        [[ -n "${main_port}" ]] && close_firewall_port "${main_port}"
 
         # 清理多端口节点服务
         local extra_service
         for extra_service in /etc/systemd/system/ss-rust-*.service; do
             [[ -f "${extra_service}" ]] || continue
             local svc_name=$(basename "${extra_service}" .service)
+            local extra_port="${svc_name#ss-rust-}"
             systemctl stop "${svc_name}" 2>/dev/null || true
             systemctl disable "${svc_name}" 2>/dev/null || true
             rm -f "${extra_service}"
+            [[ "${extra_port}" =~ ^[0-9]+$ ]] && close_firewall_port "${extra_port}"
         done
         systemctl daemon-reload
 
@@ -1134,46 +1255,24 @@ Uninstall() {
 
 # 获取IPv4地址
 getipv4() {
-    set +e
-    ipv4=$(curl -m 2 -s4 https://api.ipify.org)
+    ipv4=$(curl -m 2 -s4 https://api.ipify.org 2>/dev/null || true)
     if [[ -z "${ipv4}" ]]; then
         ipv4="IPv4_Error"
     fi
-    set -e
 }
 
 # 获取IPv6地址
 getipv6() {
-    set +e
-    ipv6=$(curl -m 2 -s6 https://api64.ipify.org)
+    ipv6=$(curl -m 2 -s6 https://api64.ipify.org 2>/dev/null || true)
     if [[ -z "${ipv6}" ]]; then
         ipv6="IPv6_Error"
     fi
-    set -e
 }
 
-# 生成安全的Base64编码
-urlsafe_base64() {
-    date=$(echo -n "$1"|base64|sed ':a;N;s/\n/ /g;ta'|sed 's/ //g;s/=//g;s/+/-/g;s/\//_/g')
-    echo -e "${date}"
-}
-
-# 生成链接和二维码
-Link_QR() {
-    if [[ "${ipv4}" != "IPv4_Error" ]]; then
-        SSbase64=$(urlsafe_base64 "${SS_METHOD}:${SS_PASSWORD}@${ipv4}:${SS_PORT}")
-        SSurl="ss://${SSbase64}"
-        link_ipv4=" 链接  [IPv4]：${Green_font_prefix}${SSurl}${Font_color_suffix}"
-        echo -e "\n IPv4 二维码:"
-        echo "${SSurl}" | qrencode -t utf8
-    fi
-    if [[ "${ipv6}" != "IPv6_Error" ]]; then
-        SSbase64=$(urlsafe_base64 "${SS_METHOD}:${SS_PASSWORD}@${ipv6}:${SS_PORT}")
-        SSurl="ss://${SSbase64}"
-        link_ipv6=" 链接  [IPv6]：${Green_font_prefix}${SSurl}${Font_color_suffix}"
-        echo -e "\n IPv6 二维码:"
-        echo "${SSurl}" | qrencode -t utf8
-    fi
+# SIP002 规定分享链接的 userinfo 使用 websafe base64（base64url，去掉 padding）。
+# 2022 系列的密码本身就是 base64，标准 base64 编码后会出现 +、/、= ，严格解析的客户端会失败。
+b64_url() {
+    echo -n "$1" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '='
 }
 
 # 查看配置信息
@@ -1224,7 +1323,7 @@ View() {
     fi
 
     # 生成 SS 链接（SIP002 格式，启用混淆插件时附带 plugin 参数）
-    local userinfo=$(echo -n "${config_method}:${config_password}" | base64 -w 0)
+    local userinfo=$(b64_url "${config_method}:${config_password}")
     local ss_url_ipv4=""
     local ss_url_ipv6=""
     local plugin_param=""
@@ -1356,17 +1455,27 @@ Update_Shell() {
         read -p "(默认: y)：" yn
         [[ -z "${yn}" ]] && yn="y"
         if [[ ${yn} == [Yy] ]]; then
+            # 通过 bash <(curl ...) 运行时 SCRIPT_PATH 为 /dev/fd、SCRIPT_NAME 为文件描述符号，
+            # 直接写回去会把脚本写到错误位置，这种情况统一更新安装时创建的固定副本
+            local target="${SCRIPT_PATH}/${SCRIPT_NAME}"
+            if [[ ! -f "${target}" || "${SCRIPT_PATH}" == /dev/fd* || "${SCRIPT_PATH}" == /proc/* ]]; then
+                target="/usr/local/bin/ss-2022.sh"
+                echo -e "${Info} 当前以管道方式运行，将更新 ${target}"
+            fi
+
             # 备份当前脚本
-            cp "${SCRIPT_PATH}/${SCRIPT_NAME}" "${SCRIPT_PATH}/${SCRIPT_NAME}.bak.${SCRIPT_VERSION}"
-            echo -e "${Info} 已备份当前版本到 ${SCRIPT_NAME}.bak.${SCRIPT_VERSION}"
+            if [[ -f "${target}" ]]; then
+                cp "${target}" "${target}.bak.${SCRIPT_VERSION}"
+                echo -e "${Info} 已备份当前版本到 ${target}.bak.${SCRIPT_VERSION}"
+            fi
             
             # 更新脚本
-            mv -f ${temp_file} "${SCRIPT_PATH}/${SCRIPT_NAME}"
-            chmod +x "${SCRIPT_PATH}/${SCRIPT_NAME}"
+            mv -f ${temp_file} "${target}"
+            chmod +x "${target}"
             echo -e "${Success} 脚本已更新至 [ ${sh_new_ver} ]"
             echo -e "${Info} 2秒后执行新脚本..."
             sleep 2s
-            exec "${SCRIPT_PATH}/${SCRIPT_NAME}"
+            exec "${target}"
         else
             echo -e "${Info} 已取消更新..."
             rm -f ${temp_file}
@@ -1630,7 +1739,7 @@ EOF
     echo -e "——————————————————————————————————"
     getipv4
     if [[ "${ipv4}" != "IPv4_Error" ]]; then
-        local node_userinfo=$(echo -n "${SS_METHOD}:${new_password}" | base64 -w 0)
+        local node_userinfo=$(b64_url "${SS_METHOD}:${new_password}")
         local node_plugin_param=$(build_plugin_param "${SS_PLUGIN}" "${SS_PLUGIN_OPTS}")
         echo -e " 链接：${Green_font_prefix}ss://${node_userinfo}@${ipv4}:${new_port}${node_plugin_param}#SS-${ipv4}-${new_port}${Font_color_suffix}"
     fi
@@ -1660,7 +1769,7 @@ list_extra_ports() {
         local node_plugin_opts=$(jq -r '.plugin_opts // empty' "$f")
         echo -e "${Green_font_prefix}[额外节点]${Font_color_suffix} 端口：${port}  加密：${method}  密码：${password}  状态：${node_status}"
         if [[ "${ipv4}" != "IPv4_Error" ]]; then
-            local node_userinfo=$(echo -n "${method}:${password}" | base64 -w 0)
+            local node_userinfo=$(b64_url "${method}:${password}")
             local node_plugin_param=$(build_plugin_param "${node_plugin}" "${node_plugin_opts}")
             echo -e "    链接：ss://${node_userinfo}@${ipv4}:${port}${node_plugin_param}#SS-${ipv4}-${port}"
         fi
@@ -1697,7 +1806,8 @@ delete_extra_port() {
     rm -f "/etc/systemd/system/ss-rust-${del_port}.service"
     rm -f "${PORTS_DIR}/${del_port}.json"
     systemctl daemon-reload
-    echo -e "${SUCCESS} 端口节点 ${del_port} 已删除（防火墙放行规则未回收，如需请手动删除）"
+    close_firewall_port "${del_port}"
+    echo -e "${SUCCESS} 端口节点 ${del_port} 已删除"
 }
 
 # 多端口管理菜单

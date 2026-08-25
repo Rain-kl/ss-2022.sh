@@ -14,7 +14,7 @@ CYAN='\033[0;36m'
 RESET='\033[0m'
 
 # 当前版本号
-current_version="4.3"
+current_version="4.4"
 
 # systemd 服务目录
 SYSTEMD_DIR="/etc/systemd/system"
@@ -512,21 +512,21 @@ uninstall_ss_rust() {
 uninstall_shadowtls() {
     echo -e "${CYAN}正在卸载 ShadowTLS...${RESET}"
 
-    # 停止并禁用所有 ShadowTLS 服务
-    while IFS= read -r service; do
-        [ -z "$service" ] && continue
-        local service_file="${SYSTEMD_DIR}/${service}"
-        local listen_port=""
-        if [ -f "$service_file" ]; then
-            listen_port=$(sed -n 's/.*--listen .*:\([0-9][0-9]*\).*/\1/p' "$service_file" | head -n 1)
-        fi
+    # 直接遍历 service 文件：systemctl list-units 只列出已加载的 unit，
+    # 已停止（未加载）的 ShadowTLS 服务会被漏掉，导致卸载不干净
+    local service_file service listen_port
+    for service_file in "${SYSTEMD_DIR}"/shadowtls-*.service; do
+        [ -f "$service_file" ] || continue
+        service=$(basename "$service_file")
+        listen_port=$(sed -n 's/.*--listen .*:\([0-9][0-9]*\).*/\1/p' "$service_file" | head -n 1)
+        echo -e "${YELLOW}正在移除 ${service}${RESET}"
         systemctl stop "$service" 2>/dev/null
         systemctl disable "$service" 2>/dev/null
         rm -f "$service_file"
         if [ -n "$listen_port" ]; then
             close_port "$listen_port"
         fi
-    done < <(systemctl list-units --type=service --all --no-legend | grep "shadowtls-" | awk '{print $1}')
+    done
     
     # 删除二进制文件
     rm -f "/usr/local/bin/shadow-tls"
