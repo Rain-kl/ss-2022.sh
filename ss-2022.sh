@@ -67,6 +67,18 @@ SS_DNS=""
 SS_PLUGIN=""
 SS_PLUGIN_OPTS=""
 
+# CLI 传入参数缓存与非交互模式标记
+CLI_PORT=""
+CLI_PASSWORD=""
+CLI_METHOD=""
+CLI_TFO=""
+CLI_DNS=""
+CLI_PLUGIN=""
+CLI_PLUGIN_OPTS=""
+NON_INTERACTIVE=false
+ACTION=""
+FORCE_INSTALL=false
+
 # 错误处理函数
 error_exit() {
     echo -e "${ERROR} $1" >&2
@@ -1357,11 +1369,13 @@ Restart() {
 Update() {
     check_installed_status || return 1
     check_new_ver
-    check_ver_comparison || return 0
-    echo -e "${Info} 是否更新 Shadowsocks Rust？[Y/n]"
-    printf "%b" "(默认: y)："
-    read -r yn
-    [ -z "${yn}" ] && yn="y"
+    local yn="y"
+    if [ "${NON_INTERACTIVE}" != "true" ]; then
+        echo -e "${Info} 是否更新 Shadowsocks Rust？[Y/n]"
+        printf "%b" "(默认: y)："
+        read -r yn
+        [ -z "${yn}" ] && yn="y"
+    fi
     case "${yn}" in
         [Yy]*)
             detect_arch
@@ -1387,11 +1401,14 @@ Update() {
 # 卸载
 Uninstall() {
     check_installed_status || return 1
-    echo "确定要卸载 Shadowsocks Rust 吗？[y/N]"
-    echo
-    printf "%b" "(默认：n)："
-    read -r unyn
-    [ -z "${unyn}" ] && unyn="n"
+    local unyn="y"
+    if [ "${NON_INTERACTIVE}" != "true" ]; then
+        echo "确定要卸载 Shadowsocks Rust 吗？[y/N]"
+        echo
+        printf "%b" "(默认：n)："
+        read -r unyn
+        [ -z "${unyn}" ] && unyn="n"
+    fi
     case "${unyn}" in
         [Yy]*)
             local main_port=""
@@ -1621,7 +1638,9 @@ Status() {
     elif [ -x "/etc/init.d/ss-rust" ]; then
         /etc/init.d/ss-rust status || true
     fi
-    Before_Start_Menu
+    if [ "${NON_INTERACTIVE}" != "true" ]; then
+        Before_Start_Menu
+    fi
 }
 
 # 更新脚本
@@ -2147,5 +2166,354 @@ Start_Menu() {
     done
 }
 
-# 启动脚本
-Start_Menu "$@"
+# CLI 帮助信息
+show_cli_help() {
+    cat << EOF
+Shadowsocks Rust (SS-2022) 管理脚本 v${SCRIPT_VERSION}
+
+用法:
+  $0 [命令] [选项]
+
+命令:
+  install       安装并启动 Shadowsocks Rust (默认命令)
+  uninstall     卸载 Shadowsocks Rust
+  update        更新 Shadowsocks Rust 到最新版本
+  start         启动服务
+  stop          停止服务
+  restart       重启服务
+  status        查看服务运行状态
+  view, info    查看节点配置、客户端导入链接及二维码
+  help, -h      显示此帮助信息
+
+选项:
+  -p, --port <端口>        指定监听端口 [1-65535] (默认: 随机生成 10000-65535 端口)
+  -k, --password <密码>    指定密码 (默认: 自动生成符合加密方式要求的 Base64 密钥)
+  -m, --method <加密方式>  指定加密方式 (默认: 2022-blake3-aes-128-gcm)
+  --tfo <true|false>       启用或禁用 TCP Fast Open (默认: true)
+  --dns <DNS服务器>        指定自定义 DNS，多个用逗号分隔 (默认: 系统默认 DNS)
+  --plugin <插件>          混淆插件 (可选: none, obfs-http, obfs-tls，默认: none)
+  -y, --yes                非交互模式 (免确认直接执行)
+  -f, --force              强制重新安装 (覆盖已安装配置)
+
+一键示例:
+  # 一键配置 50000 端口（其余配置采用安全默认值）:
+  $0 -p 50000
+
+  # 一键全默认配置安装（随机高位端口与安全强密钥）:
+  $0 install
+
+  # 一键指定端口与自定义 Base64 密钥:
+  $0 install -p 50000 -k "YOUR_BASE64_KEY=="
+
+  # 一键指定 256 位加密与 50000 端口:
+  $0 install -p 50000 -m 2022-blake3-aes-256-gcm
+EOF
+}
+
+# 解析命令行参数
+parse_cli_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            install|uninstall|update|start|stop|restart|status|view|info)
+                ACTION="$1"
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            -p|--port)
+                [ $# -ge 2 ] || error_exit "缺少端口参数: -p/--port 需要接端口号 [1-65535]"
+                CLI_PORT="$2"
+                NON_INTERACTIVE=true
+                shift 2
+                ;;
+            --port=*)
+                CLI_PORT="${1#*=}"
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            -k|--password|-w)
+                [ $# -ge 2 ] || error_exit "缺少密码参数: -k/--password 需要接密码"
+                CLI_PASSWORD="$2"
+                NON_INTERACTIVE=true
+                shift 2
+                ;;
+            --password=*)
+                CLI_PASSWORD="${1#*=}"
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            -m|--method)
+                [ $# -ge 2 ] || error_exit "缺少加密方式参数: -m/--method 需要接加密算法"
+                CLI_METHOD="$2"
+                NON_INTERACTIVE=true
+                shift 2
+                ;;
+            --method=*)
+                CLI_METHOD="${1#*=}"
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            --tfo)
+                if [ $# -ge 2 ] && { [ "$2" = "true" ] || [ "$2" = "false" ]; }; then
+                    CLI_TFO="$2"
+                    shift 2
+                else
+                    CLI_TFO="true"
+                    shift
+                fi
+                NON_INTERACTIVE=true
+                ;;
+            --tfo=*)
+                CLI_TFO="${1#*=}"
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            --dns)
+                [ $# -ge 2 ] || error_exit "缺少 DNS 参数: --dns 需要接 DNS 地址"
+                CLI_DNS="$2"
+                NON_INTERACTIVE=true
+                shift 2
+                ;;
+            --dns=*)
+                CLI_DNS="${1#*=}"
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            --plugin)
+                [ $# -ge 2 ] || error_exit "缺少插件参数: --plugin 需要接插件名"
+                case "$2" in
+                    http|obfs-http) CLI_PLUGIN="obfs-server"; CLI_PLUGIN_OPTS="obfs=http" ;;
+                    tls|obfs-tls) CLI_PLUGIN="obfs-server"; CLI_PLUGIN_OPTS="obfs=tls" ;;
+                    none|"") CLI_PLUGIN=""; CLI_PLUGIN_OPTS="" ;;
+                    *) CLI_PLUGIN="$2"; CLI_PLUGIN_OPTS="" ;;
+                esac
+                NON_INTERACTIVE=true
+                shift 2
+                ;;
+            --plugin=*)
+                opt_val="${1#*=}"
+                case "$opt_val" in
+                    http|obfs-http) CLI_PLUGIN="obfs-server"; CLI_PLUGIN_OPTS="obfs=http" ;;
+                    tls|obfs-tls) CLI_PLUGIN="obfs-server"; CLI_PLUGIN_OPTS="obfs=tls" ;;
+                    none|"") CLI_PLUGIN=""; CLI_PLUGIN_OPTS="" ;;
+                    *) CLI_PLUGIN="$opt_val"; CLI_PLUGIN_OPTS="" ;;
+                esac
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            -f|--force)
+                FORCE_INSTALL=true
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            -y|--yes|--non-interactive)
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            -h|--help|help)
+                show_cli_help
+                exit 0
+                ;;
+            *)
+                echo -e "${ERROR} 未知参数: $1"
+                show_cli_help
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# 非交互式一键安装
+cli_install() {
+    # 1. 已安装且未指定 --force：直接根据传入参数更新配置
+    if [ -e "${BINARY_PATH}" ] && [ "${FORCE_INSTALL}" != "true" ]; then
+        echo -e "${INFO} 检测到 Shadowsocks Rust 已安装，正在根据指定参数更新配置..."
+        read_config
+        local old_port="${SS_PORT}"
+        
+        [ -n "${CLI_PORT}" ] && SS_PORT="${CLI_PORT}"
+        if ! is_number "${SS_PORT}" || [ "${SS_PORT}" -lt 1 ] || [ "${SS_PORT}" -gt 65535 ]; then
+            error_exit "端口无效: ${SS_PORT} (必须在 1-65535 之间)"
+        fi
+        
+        [ -n "${CLI_METHOD}" ] && SS_METHOD="${CLI_METHOD}"
+        
+        if [ -n "${CLI_PASSWORD}" ]; then
+            SS_PASSWORD="${CLI_PASSWORD}"
+            local req_l
+            req_l=$(required_key_length "${SS_METHOD}")
+            if [ -n "${req_l}" ]; then
+                local dec_l
+                dec_l=$(printf '%s' "${SS_PASSWORD}" | base64 -d 2>/dev/null | wc -c)
+                if [ "${dec_l}" -ne "${req_l}" ]; then
+                    error_exit "密码不符合加密算法要求：当前密码解码后为 ${dec_l} 字节，但 ${SS_METHOD} 要求 ${req_l} 字节！"
+                fi
+            fi
+        else
+            ensure_password_matches_method
+        fi
+        
+        [ -n "${CLI_TFO}" ] && SS_TFO="${CLI_TFO}"
+        [ -n "${CLI_DNS}" ] && SS_DNS="${CLI_DNS}"
+        [ -n "${CLI_PLUGIN}" ] && SS_PLUGIN="${CLI_PLUGIN}"
+        [ -n "${CLI_PLUGIN_OPTS}" ] && SS_PLUGIN_OPTS="${CLI_PLUGIN_OPTS}"
+        
+        check_firewall "${SS_PORT}"
+        if [ -n "${old_port}" ] && [ "${old_port}" != "${SS_PORT}" ]; then
+            close_firewall_port "${old_port}"
+        fi
+        
+        write_config
+        Restart
+        sync_shadowtls_backend_port "${SS_PORT}"
+        View
+        return 0
+    fi
+
+    # 2. 全新安装 (或强制重新安装)
+    echo -e "${INFO} 开始非交互式一键安装 Shadowsocks Rust..."
+    
+    # 端口处理 (传入则使用，未传入则默认随机高位端口)
+    if [ -n "${CLI_PORT}" ]; then
+        SS_PORT="${CLI_PORT}"
+    else
+        SS_PORT=$(generate_random_port)
+    fi
+    if ! is_number "${SS_PORT}" || [ "${SS_PORT}" -lt 1 ] || [ "${SS_PORT}" -gt 65535 ]; then
+        error_exit "端口无效: ${SS_PORT} (必须在 1-65535 之间)"
+    fi
+    
+    # 加密算法处理 (默认: 2022-blake3-aes-128-gcm)
+    if [ -n "${CLI_METHOD}" ]; then
+        SS_METHOD="${CLI_METHOD}"
+    else
+        SS_METHOD="2022-blake3-aes-128-gcm"
+    fi
+    
+    # 密码处理 (传入则校验，未传入则自动生成对应长度的合规 Base64 密钥)
+    if [ -n "${CLI_PASSWORD}" ]; then
+        SS_PASSWORD="${CLI_PASSWORD}"
+        local req_len
+        req_len=$(required_key_length "${SS_METHOD}")
+        if [ -n "${req_len}" ]; then
+            local dec_len
+            dec_len=$(printf '%s' "${SS_PASSWORD}" | base64 -d 2>/dev/null | wc -c)
+            if [ "${dec_len}" -ne "${req_len}" ]; then
+                error_exit "密码不符合加密算法要求：当前密码解码后为 ${dec_len} 字节，但 ${SS_METHOD} 要求 ${req_len} 字节！"
+            fi
+        fi
+    else
+        SS_PASSWORD=$(generate_password_for_method "${SS_METHOD}")
+    fi
+    
+    # TFO (默认 true)
+    if [ -n "${CLI_TFO}" ]; then
+        SS_TFO="${CLI_TFO}"
+    else
+        SS_TFO="true"
+    fi
+    
+    # DNS (默认系统默认)
+    if [ -n "${CLI_DNS}" ]; then
+        SS_DNS="${CLI_DNS}"
+    else
+        SS_DNS=""
+    fi
+    
+    # 插件
+    if [ -n "${CLI_PLUGIN}" ]; then
+        SS_PLUGIN="${CLI_PLUGIN}"
+        SS_PLUGIN_OPTS="${CLI_PLUGIN_OPTS}"
+        if [ "${SS_PLUGIN}" = "obfs-server" ]; then
+            install_obfs_plugin || echo -e "${WARNING} simple-obfs 插件安装失败，本次跳过插件"
+        fi
+    else
+        SS_PLUGIN=""
+        SS_PLUGIN_OPTS=""
+    fi
+    
+    echo -e "${INFO} 参数确认:"
+    echo -e "  - 端口: ${Green_font_prefix}${SS_PORT}${Font_color_suffix}"
+    echo -e "  - 加密: ${Green_font_prefix}${SS_METHOD}${Font_color_suffix}"
+    echo -e "  - 密码: ${Green_font_prefix}${SS_PASSWORD}${Font_color_suffix}"
+    echo -e "  - TFO : ${Green_font_prefix}${SS_TFO}${Font_color_suffix}"
+    [ -n "${SS_DNS}" ] && echo -e "  - DNS : ${Green_font_prefix}${SS_DNS}${Font_color_suffix}"
+    [ -n "${SS_PLUGIN}" ] && echo -e "  - 插件: ${Green_font_prefix}${SS_PLUGIN} (${SS_PLUGIN_OPTS})${Font_color_suffix}"
+    
+    echo -e "${INFO} 开始安装系统依赖..."
+    install_dependencies
+    
+    echo -e "${INFO} 下载安装 Shadowsocks Rust 二进制..."
+    detect_arch
+    get_latest_version
+    download
+    
+    echo -e "${INFO} 写入配置文件..."
+    write_config
+    
+    echo -e "${INFO} 放行防火墙端口并安装系统服务..."
+    check_firewall "${SS_PORT}"
+    install_service
+    
+    # 创建命令快捷方式
+    local cur_script
+    cur_script=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+    if [ -f "$cur_script" ]; then
+        cp "$cur_script" "/usr/local/bin/ss-2022.sh" 2>/dev/null || true
+    fi
+    chmod +x "/usr/local/bin/ss-2022.sh" 2>/dev/null || true
+    ln -sf "/usr/local/bin/ss-2022.sh" "/usr/local/bin/ssrust" 2>/dev/null || true
+    
+    echo -e "${INFO} 启动 Shadowsocks Rust 服务..."
+    if start_service; then
+        echo -e "${SUCCESS} Shadowsocks Rust 一键安装并启动成功！"
+        View
+    else
+        error_exit "Shadowsocks Rust 启动失败，请检查服务状态与日志！"
+    fi
+}
+
+# 执行 CLI 命令
+execute_cli() {
+    check_root
+    detect_os
+    
+    [ -z "${ACTION}" ] && ACTION="install"
+
+    case "${ACTION}" in
+        install)
+            cli_install
+            ;;
+        uninstall)
+            Uninstall
+            ;;
+        update)
+            Update
+            ;;
+        start)
+            start_service
+            ;;
+        stop)
+            Stop
+            ;;
+        restart)
+            Restart
+            ;;
+        status)
+            Status
+            ;;
+        view|info)
+            View
+            ;;
+        *)
+            error_exit "未知命令: ${ACTION}"
+            ;;
+    esac
+}
+
+# 启动入口
+if [ $# -gt 0 ]; then
+    parse_cli_args "$@"
+    execute_cli
+else
+    Start_Menu
+fi

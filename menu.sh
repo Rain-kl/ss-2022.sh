@@ -26,7 +26,7 @@ MAINLAND_SCRIPT_DIR="/usr/local/share/ss-2022"
 # 检查是否以 root 权限运行
 check_root() {
     if [ "$(id -u)" != "0" ]; then
-        echo -e "${RED}请以 root 权限运行此脚本${RESET}"
+        printf "%b\n" "${RED}请以 root 权限运行此脚本${RESET}"
         exit 1
     fi
 }
@@ -373,18 +373,19 @@ update_script() {
 run_script_module() {
     local script_name="$1"
     local remote_url="$2"
+    shift 2
 
     # 优先查找当前脚本所在目录的本地同名文件
     local script_dir
     script_dir=$(dirname "$0")
     if [ -f "${script_dir}/${script_name}" ]; then
-        sh "${script_dir}/${script_name}"
+        sh "${script_dir}/${script_name}" "$@"
         return $?
     fi
 
     # 查找 /usr/local/bin
     if [ -f "/usr/local/bin/${script_name}" ]; then
-        sh "/usr/local/bin/${script_name}"
+        sh "/usr/local/bin/${script_name}" "$@"
         return $?
     fi
 
@@ -401,7 +402,7 @@ run_script_module() {
 
     if [ -s "$tmp_file" ]; then
         chmod +x "$tmp_file"
-        sh "$tmp_file"
+        sh "$tmp_file" "$@"
         local ret=$?
         rm -f "$tmp_file"
         return $ret
@@ -414,17 +415,17 @@ run_script_module() {
 
 # 安装/管理 Snell
 manage_snell() {
-    run_script_module "snell.sh" "https://raw.githubusercontent.com/jinqians/snell.sh/main/snell.sh"
+    run_script_module "snell.sh" "https://raw.githubusercontent.com/jinqians/snell.sh/main/snell.sh" "$@"
 }
 
 # 安装/管理 SS-2022
 manage_ss_rust() {
-    run_script_module "ss-2022.sh" "https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/ss-2022.sh"
+    run_script_module "ss-2022.sh" "https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/ss-2022.sh" "$@"
 }
 
 # 安装/管理 ShadowTLS
 manage_shadowtls() {
-    run_script_module "shadowtls.sh" "https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/shadowtls.sh"
+    run_script_module "shadowtls.sh" "https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/shadowtls.sh" "$@"
 }
 
 # 管理中国大陆IP屏蔽
@@ -432,7 +433,7 @@ manage_mainland_block() {
     local script_dir
     script_dir=$(dirname "$0")
     if [ -f "${script_dir}/block-mainland.sh" ]; then
-        sh "${script_dir}/block-mainland.sh"
+        sh "${script_dir}/block-mainland.sh" "$@"
         return $?
     fi
 
@@ -455,7 +456,7 @@ manage_mainland_block() {
     fi
 
     chmod +x "${MAINLAND_SCRIPT_DIR}/block-mainland.sh" "${MAINLAND_SCRIPT_DIR}/extract-cn-ip-from-mmdb.py"
-    PYTHONIOENCODING=UTF-8 sh "${MAINLAND_SCRIPT_DIR}/block-mainland.sh"
+    PYTHONIOENCODING=UTF-8 sh "${MAINLAND_SCRIPT_DIR}/block-mainland.sh" "$@"
 }
 
 # 安装/管理 VLESS Reality（引导至 PSM）
@@ -713,10 +714,49 @@ show_menu() {
     read -r num
 }
 
+# 快速帮助无需 root 权限
+case "${1:-}" in
+    -h|--help|help)
+        echo "统一管理控制台快捷命令:"
+        echo "  $0                  启动交互式管理菜单"
+        echo "  $0 -p <端口>        一键安装/配置 SS-2022 (如: $0 -p 50000)"
+        echo "  $0 ss [选项]        调用 SS-2022 脚本命令"
+        echo "  $0 block [命令]     调用大陆 IP 屏蔽脚本命令"
+        echo "  $0 shadowtls [命令] 调用 ShadowTLS 脚本命令"
+        exit 0
+        ;;
+esac
+
 # 初始检查
 check_root
 check_dependencies
 install_global_command
+
+# 如果有命令行参数传入，支持非交互式调用与转发
+if [ $# -gt 0 ]; then
+    case "$1" in
+        ss|ss-rust|ss2022)
+            shift
+            manage_ss_rust "$@"
+            exit $?
+            ;;
+        block|block-mainland)
+            shift
+            manage_mainland_block "$@"
+            exit $?
+            ;;
+        shadowtls)
+            shift
+            manage_shadowtls "$@"
+            exit $?
+            ;;
+        *)
+            # 默认将参数转发给 SS-2022 (如: menu.sh -p 50000)
+            manage_ss_rust "$@"
+            exit $?
+            ;;
+    esac
+fi
 
 # 主循环
 while true; do

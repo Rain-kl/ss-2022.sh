@@ -42,7 +42,46 @@
 > [!NOTE]
 > 请确保系统已安装基础工具（如 `curl` 或 `wget`），且以 **root** 权限运行。脚本已原生支持 BusyBox `ash`、Alpine `apk`、Debian `apt`、RHEL `dnf`/`yum`、Arch `pacman`、OpenWrt `opkg` 等主流环境。
 
-### 方式一：推荐运行统一管理菜单（一站式管理）
+### ⚡ 一键极速配置（免交互，推荐）
+
+无需进入交互式 TUI 菜单，支持直接通过参数一键完成安装、配置、防火墙放行与开机自启。未传入的配置项全部自动使用最佳安全默认值（如自动生成符合 SS-2022 规范的 Base64 强密钥，加密算法默认 `2022-blake3-aes-128-gcm`）。
+
+#### 🎯 一键配置 50000 端口的 Shadowsocks 代理：
+```sh
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/ss-2022.sh)" -- -p 50000
+```
+*或使用管道传递：*
+```sh
+curl -fsSL https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/ss-2022.sh | sh -s -- -p 50000
+```
+*若已下载脚本或本地运行：*
+```sh
+./ss-2022.sh -p 50000
+# 或通过已安装的全局 menu 命令：
+menu -p 50000
+```
+
+#### 📌 更多一键免交互示例：
+```sh
+# 1. 全默认参数极速安装（自动分配随机高位端口与安全强密钥）：
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/ss-2022.sh)" -- install
+
+# 2. 一键指定 50000 端口与自定义 Base64 密钥：
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/ss-2022.sh)" -- -p 50000 -k "YOUR_BASE64_KEY=="
+
+# 3. 一键指定 50000 端口与 256 位加密：
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/ss-2022.sh)" -- -p 50000 -m 2022-blake3-aes-256-gcm
+
+# 4. 服务启停、状态与卸载快捷命令：
+./ss-2022.sh status       # 查看服务运行状态
+./ss-2022.sh view         # 查看节点配置与客户端链接二维码
+./ss-2022.sh restart      # 重启服务
+./ss-2022.sh uninstall -y # 免确认静默卸载
+```
+
+---
+
+### 方式一：交互式控制台菜单（适合初学者）
 
 首次运行会自动将快捷命令注册到 `/usr/local/bin/menu`，后续只需在终端输入 `menu` 即可随时唤起：
 
