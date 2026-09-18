@@ -1,6 +1,6 @@
 # Shadowsocks Rust + ShadowTLS 安装与综合管理脚本套件
 
-这是一个用于在 Linux（Debian / Ubuntu / CentOS / RHEL / Rocky 等）服务器上快速安装、配置和管理 **Shadowsocks Rust (SS-2022)**、**ShadowTLS V3** 及 **中国大陆 IP 防火墙屏蔽** 的一站式工具集合。
+这是一个用于在各类 Linux 服务器（Debian / Ubuntu / CentOS / RHEL / Rocky / **Alpine Linux (musl)** / **BusyBox (`ash`)** / Arch / OpenWrt / Void 等）上快速安装、配置和管理 **Shadowsocks Rust (SS-2022)**、**ShadowTLS V3** 及 **中国大陆 IP 防火墙屏蔽** 的一站式工具集合。全套脚本采用纯 POSIX `/bin/sh` 标准重构，零 bash 语法强依赖，全面支持 systemd、OpenRC 及 SysVinit 服务管理。
 
 ---
 
@@ -10,10 +10,10 @@
 
 | 脚本文件 | 类型 | 说明与主要职责 |
 | :--- | :--- | :--- |
-| **`menu.sh`** | Shell | **全局统一控制台（推荐入口）**。整合所有脚本的交互式 TUI，支持查看各服务资源占用（CPU/内存）、统一安装/卸载清理、配置全局 `menu` 快捷指令 |
-| **`ss-2022.sh`** | Shell | **Shadowsocks Rust 核心管理**。支持安装、更新、卸载、参数配置、多端口节点管理、客户端配置导出（Surge/Clash/Shadowrocket）及终端二维码 |
-| **`shadowtls.sh`** | Shell | **ShadowTLS V3 伪装增强**。为 SS-Rust 或 Snell 后端套上真实 TLS 握手特征，防止主动探测，自动生成复合配置与防火墙放行规则 |
-| **`block-mainland.sh`** | Shell | **中国大陆 IP 来源屏蔽**。基于 `ipset` + `iptables` 阻断来自中国大陆 IP 段对各节点端口的访问，支持开机自动恢复与定时更新 |
+| **`menu.sh`** | POSIX Shell | **全局统一控制台（推荐入口）**。整合所有脚本的交互式 TUI，支持跨 init 系统查看各服务资源占用（CPU/内存）、统一安装/卸载清理、配置全局 `menu` 快捷指令 |
+| **`ss-2022.sh`** | POSIX Shell | **Shadowsocks Rust 核心管理**。自动适配 musl/glibc，支持安装、更新、卸载、多端口管理、客户端配置导出（Surge/Clash/Shadowrocket）及终端二维码 |
+| **`shadowtls.sh`** | POSIX Shell | **ShadowTLS V3 伪装增强**。为 SS-Rust 或 Snell 后端套上真实 TLS 握手特征，防止主动探测，自动生成复合配置与防火墙放行规则 |
+| **`block-mainland.sh`** | POSIX Shell | **中国大陆 IP 来源屏蔽**。基于 `ipset` + `iptables` 阻断来自中国大陆 IP 段对各节点端口的访问，支持开机自动恢复与定时更新 |
 | **`extract-cn-ip-from-mmdb.py`** | Python | **GeoIP2 数据解析工具**。利用 `maxminddb` 库从 MaxMind 数据库中提取、去重并排序全部中国 IPv4 CIDR 段，供屏蔽脚本使用 |
 
 ```
@@ -40,18 +40,18 @@
 ## 快速使用
 
 > [!NOTE]
-> 请确保系统已安装基础工具（如 `curl`、`wget`、`jq` 等），且以 **root** 权限运行。
+> 请确保系统已安装基础工具（如 `curl` 或 `wget`），且以 **root** 权限运行。脚本已原生支持 BusyBox `ash`、Alpine `apk`、Debian `apt`、RHEL `dnf`/`yum`、Arch `pacman`、OpenWrt `opkg` 等主流环境。
 
 ### 方式一：推荐运行统一管理菜单（一站式管理）
 
 首次运行会自动将快捷命令注册到 `/usr/local/bin/menu`，后续只需在终端输入 `menu` 即可随时唤起：
 
-```bash
-wget -O menu.sh https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/menu.sh && chmod +x menu.sh && ./menu.sh
+```sh
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/menu.sh)"
 ```
-*或者直接通过 curl 执行：*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/menu.sh)
+*或者先下载再执行：*
+```sh
+wget -O menu.sh https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/menu.sh && chmod +x menu.sh && ./menu.sh
 ```
 
 ---
@@ -193,15 +193,27 @@ bash <(curl -fsSL https://psm.jinqians.com)
 
 - **查看 SS-Rust 服务状态**：
   ```bash
+  # systemd (Debian / Ubuntu / CentOS / Arch 等)
   systemctl status ss-rust
+
+  # OpenRC (Alpine Linux)
+  rc-service ss-rust status
   ```
 - **查看 SS-Rust 日志**：
   ```bash
+  # systemd
   journalctl -u ss-rust -e --no-pager -n 50
+
+  # OpenRC / 独立日志文件
+  tail -n 50 /var/log/ss-rust.log
   ```
 - **查看 ShadowTLS 服务状态**：
   ```bash
+  # systemd
   systemctl status shadowtls-ss
+
+  # OpenRC (Alpine Linux)
+  rc-service shadowtls-ss status
   ```
 - **查看大陆屏蔽规则状态**：
   ```bash
