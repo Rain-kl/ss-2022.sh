@@ -40,7 +40,9 @@
 ## 快速使用
 
 > [!NOTE]
-> 请确保系统已安装基础工具（如 `curl` 或 `wget`），且以 **root** 权限运行。脚本已原生支持 BusyBox `ash`、Alpine `apk`、Debian `apt`、RHEL `dnf`/`yum`、Arch `pacman`、OpenWrt `opkg` 等主流环境。
+> - 请确保系统以 **root** 权限运行。脚本已原生支持 BusyBox `ash`、Alpine `apk`、Debian `apt`、RHEL `dnf`/`yum`、Arch `pacman`、OpenWrt `opkg` 等主流环境。
+> - **全静态编译兼容性（Musl）**：Linux 平台默认优先采用官方全静态链接的 `musl` 构建版（零外部动态 libc 依赖），彻底杜绝在 Ubuntu 20.04/22.04、Debian 等系统上因宿主机 Glibc 版本过低而报错 `GLIBC_2.38/GLIBC_2.39 not found` 的问题。
+> - **纯 POSIX 输出兼容**：内置 shell 转义封装，完美兼容 Debian/Ubuntu 下默认的 Dash (`/bin/sh`)，杜绝终端输出字面量 `-e`。
 
 ### ⚡ 一键极速配置（免交互，推荐）
 

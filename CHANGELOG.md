@@ -1,5 +1,16 @@
 # 更新日志
 
+## v4.5（2026-09-18）
+
+### 严重：Ubuntu 22.04 / Debian / CentOS 因 GLIBC 过低导致启动崩溃
+- `ss-2022.sh` 在检测到 Linux 宿主机 libc 为 gnu 时，原先默认下载 `x86_64-unknown-linux-gnu`。而 Shadowsocks-Rust 官方 Release 的 gnu 构建版基于高版本 Glibc runner 编译，强依赖 `GLIBC_2.38` 与 `GLIBC_2.39`。
+- 导致在 Ubuntu 22.04 LTS（默认 Glibc 2.35）、Ubuntu 20.04、Debian 12（Glibc 2.36）、CentOS 等系统上安装后，服务因 `version GLIBC_2.38 not found` 直接崩溃。
+- **全面重构为 Linux 平台默认优先采用静态链接的 Musl 构建版**（`*-unknown-linux-musl`），彻底实现零外部动态 libc 依赖，在任意 Linux 发行版及内核版本上开箱即用稳定运行。
+- 在系统服务安装前新增**二进制就绪预检**（`./ssserver --version` / `shadow-tls --version`），前置拦截架构或动态库不兼容问题。
+
+### 修复：Debian/Ubuntu 默认 Dash (`/bin/sh`) 输出字面量 `-e`
+- 在 `ss-2022.sh`、`menu.sh`、`shadowtls.sh` 头部注入 POSIX 兼容的 `echo()` 函数封装，彻底消除 Dash 下 `echo -e` 打印字面量 `-e [信息]` 的问题，统一多环境下的色彩和格式输出。
+
 ## v4.4（2026-08-25）
 
 ss-2022.sh 1.9 → 2.0，menu.sh 4.3 → 4.4，block-mainland.sh 1.0 → 1.1

@@ -12,6 +12,16 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 RESET='\033[0m'
 
+# POSIX 兼容 echo 封装：解决 Dash/Ash/Bash 等不同 shell 下 -e 转义与颜色解析差异，防止输出字面量 '-e'
+echo() {
+    case "$1" in
+        -e) shift; printf "%b\n" "$*" ;;
+        -ne|-en) shift; printf "%b" "$*" ;;
+        -n) shift; printf "%b" "$*" ;;
+        *) printf "%b\n" "$*" ;;
+    esac
+}
+
 # 当前版本号
 current_version="4.4"
 

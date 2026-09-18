@@ -26,6 +26,16 @@ MAINLAND_EXTRACT_SCRIPT="/usr/local/bin/extract-cn-ip-from-mmdb.py"
 MAINLAND_BLOCK_REPO_URL="https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/block-mainland.sh"
 MAINLAND_EXTRACT_REPO_URL="https://raw.githubusercontent.com/Rain-kl/ss-2022.sh/main/extract-cn-ip-from-mmdb.py"
 
+# POSIX 兼容 echo 封装：解决 Dash/Ash/Bash 等不同 shell 下 -e 转义与颜色解析差异，防止输出字面量 '-e'
+echo() {
+    case "$1" in
+        -e) shift; printf "%b\n" "$*" ;;
+        -ne|-en) shift; printf "%b" "$*" ;;
+        -n) shift; printf "%b" "$*" ;;
+        *) printf "%b\n" "$*" ;;
+    esac
+}
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -173,7 +183,7 @@ rhel_pkg_mgr() {
     fi
 }
 
-# 检测系统架构 (自动识别 musl libc，适配 Alpine / OpenWrt / BusyBox)
+# 检测系统架构 (Linux 默认优先采用全静态链接 musl 构建版，彻底杜绝 GLIBC 版本不匹配报错)
 detect_arch() {
     local arch
     arch=$(uname -m)
@@ -192,35 +202,34 @@ detect_arch() {
         "Linux")
             case "${arch}" in
                 "x86_64"|"amd64")
-                    if [ "$libc" = "musl" ]; then
-                        OS_ARCH="x86_64-unknown-linux-musl"
-                    else
-                        OS_ARCH="x86_64-unknown-linux-gnu"
-                    fi
+                    OS_ARCH="x86_64-unknown-linux-musl"
                     ;;
                 "aarch64"|"arm64")
-                    if [ "$libc" = "musl" ]; then
-                        OS_ARCH="aarch64-unknown-linux-musl"
-                    else
-                        OS_ARCH="aarch64-unknown-linux-gnu"
-                    fi
+                    OS_ARCH="aarch64-unknown-linux-musl"
                     ;;
                 "armv7"|"armv7l"|"armhf")
-                    if [ "$libc" = "musl" ]; then
-                        OS_ARCH="armv7-unknown-linux-musleabihf"
-                    else
-                        OS_ARCH="armv7-unknown-linux-gnueabihf"
-                    fi
+                    OS_ARCH="armv7-unknown-linux-musleabihf"
                     ;;
                 "arm"|"armv6"|"armv6l")
-                    if [ "$libc" = "musl" ]; then
-                        OS_ARCH="arm-unknown-linux-musleabi"
-                    else
-                        OS_ARCH="arm-unknown-linux-gnueabi"
-                    fi
+                    OS_ARCH="arm-unknown-linux-musleabi"
                     ;;
                 "i686"|"i386")
                     OS_ARCH="i686-unknown-linux-musl"
+                    ;;
+                "riscv64"|"riscv64gc")
+                    OS_ARCH="riscv64gc-unknown-linux-musl"
+                    ;;
+                "loongarch64")
+                    OS_ARCH="loongarch64-unknown-linux-musl"
+                    ;;
+                "mips")
+                    OS_ARCH="mips-unknown-linux-gnu"
+                    ;;
+                "mipsel")
+                    OS_ARCH="mipsel-unknown-linux-gnu"
+                    ;;
+                "mips64el")
+                    OS_ARCH="mips64el-unknown-linux-gnuabi64"
                     ;;
                 *)
                     error_exit "不支持的CPU架构: ${arch}"
@@ -232,7 +241,10 @@ detect_arch() {
             ;;
     esac
     
-    echo -e "${INFO} 检测到系统架构为 [ ${OS_ARCH} ] (libc: ${libc})"
+    if [ -z "${OS_ARCH}" ]; then
+        error_exit "无法识别系统架构: ${os} ${arch}"
+    fi
+    echo -e "${INFO} 检测到系统架构为 [ ${OS_ARCH} ] (全静态编译 / 零动态 libc 依赖)"
 }
 
 # 检查安装状态
@@ -418,19 +430,28 @@ download_ss() {
         "aarch64-apple-darwin"|"x86_64-apple-darwin")
             filename="shadowsocks-v${version}.${arch}.tar.xz"
             ;;
-        "x86_64-unknown-linux-gnu"|"x86_64-unknown-linux-musl")
+        "x86_64-unknown-linux-musl"|"x86_64-unknown-linux-gnu")
             filename="shadowsocks-v${version}.${arch}.tar.xz"
             ;;
-        "aarch64-unknown-linux-gnu"|"aarch64-unknown-linux-musl")
+        "aarch64-unknown-linux-musl"|"aarch64-unknown-linux-gnu")
             filename="shadowsocks-v${version}.${arch}.tar.xz"
             ;;
-        "arm-unknown-linux-gnueabi"|"arm-unknown-linux-gnueabihf"|"arm-unknown-linux-musleabi"|"arm-unknown-linux-musleabihf")
+        "armv7-unknown-linux-musleabihf"|"armv7-unknown-linux-gnueabihf")
             filename="shadowsocks-v${version}.${arch}.tar.xz"
             ;;
-        "armv7-unknown-linux-gnueabihf"|"armv7-unknown-linux-musleabihf")
+        "arm-unknown-linux-musleabi"|"arm-unknown-linux-musleabihf"|"arm-unknown-linux-gnueabi"|"arm-unknown-linux-gnueabihf")
             filename="shadowsocks-v${version}.${arch}.tar.xz"
             ;;
         "i686-unknown-linux-musl")
+            filename="shadowsocks-v${version}.${arch}.tar.xz"
+            ;;
+        "riscv64gc-unknown-linux-musl"|"riscv64gc-unknown-linux-gnu")
+            filename="shadowsocks-v${version}.${arch}.tar.xz"
+            ;;
+        "loongarch64-unknown-linux-musl"|"loongarch64-unknown-linux-gnu")
+            filename="shadowsocks-v${version}.${arch}.tar.xz"
+            ;;
+        "mips-unknown-linux-gnu"|"mipsel-unknown-linux-gnu"|"mips64el-unknown-linux-gnuabi64")
             filename="shadowsocks-v${version}.${arch}.tar.xz"
             ;;
         *)
@@ -440,10 +461,33 @@ download_ss() {
     
     echo -e "${INFO} 开始下载 Shadowsocks Rust ${version}..."
     echo -e "${INFO} 下载地址：${url}/${filename}"
-    wget --no-check-certificate -N "${url}/${filename}"
+    rm -f "${filename}"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -O "${url}/${filename}" || true
+    fi
+    if [ ! -s "${filename}" ] && command -v wget >/dev/null 2>&1; then
+        wget --no-check-certificate -q "${url}/${filename}" -O "${filename}" || true
+    fi
     
-    if [ ! -e "${filename}" ]; then
-        error_exit "Shadowsocks Rust 下载失败！"
+    # 容错降级：若特定历史版本未提供 musl 构建，自动尝试 gnu 构建
+    if [ ! -s "${filename}" ] && echo "${arch}" | grep -q "musl"; then
+        local fallback_arch
+        fallback_arch=$(echo "${arch}" | sed 's/musl/gnu/')
+        local fallback_file="shadowsocks-v${version}.${fallback_arch}.tar.xz"
+        echo -e "${WARNING} musl 版本未获取到，尝试备用 gnu 构建版: ${fallback_file}..."
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL -O "${url}/${fallback_file}" || true
+        fi
+        if [ ! -s "${fallback_file}" ] && command -v wget >/dev/null 2>&1; then
+            wget --no-check-certificate -q "${url}/${fallback_file}" -O "${fallback_file}" || true
+        fi
+        if [ -s "${fallback_file}" ]; then
+            filename="${fallback_file}"
+        fi
+    fi
+
+    if [ ! -s "${filename}" ]; then
+        error_exit "Shadowsocks Rust 下载失败，请检查网络或 GitHub 连通性！"
     fi
     
     case "${filename}" in
@@ -465,13 +509,24 @@ download_ss() {
     
     rm -f "${filename}"
     chmod +x ssserver
+
+    # 关键预检：立即测试运行二进制，验证其在当前系统架构及内核下能否执行
+    local test_out
+    if ! test_out=$(./ssserver --version 2>&1); then
+        if echo "${test_out}" | grep -qi "GLIBC"; then
+            error_exit "Shadowsocks Rust 二进制与当前系统 GLIBC 不兼容！\n错误详情: ${test_out}\n建议: 当前系统缺少高版本 GLIBC，必须使用静态编译 musl 构建版。"
+        else
+            error_exit "Shadowsocks Rust 二进制无法在当前系统执行！\n错误详情: ${test_out}"
+        fi
+    fi
+    
     mkdir -p "$(dirname "${BINARY_PATH}")"
     mv -f ssserver "${BINARY_PATH}"
     rm -f sslocal ssmanager ssservice ssurl
     
     mkdir -p "${INSTALL_DIR}"
     echo "${version}" > "${VERSION_FILE}"
-    echo -e "${SUCCESS} Shadowsocks Rust ${version} 下载安装完成！"
+    echo -e "${SUCCESS} Shadowsocks Rust ${version} 下载安装并自检通过！"
 }
 
 # 下载

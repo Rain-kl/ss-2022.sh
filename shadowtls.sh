@@ -12,6 +12,16 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 RESET='\033[0m'
 
+# POSIX 兼容 echo 封装：解决 Dash/Ash/Bash 等不同 shell 下 -e 转义与颜色解析差异，防止输出字面量 '-e'
+echo() {
+    case "$1" in
+        -e) shift; printf "%b\n" "$*" ;;
+        -ne|-en) shift; printf "%b" "$*" ;;
+        -n) shift; printf "%b" "$*" ;;
+        *) printf "%b\n" "$*" ;;
+    esac
+}
+
 # 定义系统路径
 INSTALL_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -810,6 +820,14 @@ install_shadowtls() {
     mkdir -p "$INSTALL_DIR"
     mv "$tmp_bin" "$INSTALL_DIR/shadow-tls"
     chmod +x "$INSTALL_DIR/shadow-tls"
+    
+    # 验证 ShadowTLS 二进制文件在当前系统上可正常运行
+    local test_out
+    if ! test_out=$("$INSTALL_DIR/shadow-tls" --version 2>&1); then
+        echo -e "${RED}ShadowTLS 二进制文件无法在当前系统执行！${RESET}"
+        echo -e "${RED}错误详情: ${test_out}${RESET}"
+        return 1
+    fi
     
     local password
     password=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16 || awk 'BEGIN{srand(); for(i=0;i<16;i++) printf "%c", int(65+rand()*26)}')
