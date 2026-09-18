@@ -2,3 +2,4 @@
 .backup-before-fix/
 CHANGES-local.md
 *.bak.*
+.idea/
